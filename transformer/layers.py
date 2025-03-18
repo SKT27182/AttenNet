@@ -1,4 +1,5 @@
 import copy
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,7 +34,7 @@ class PositionalEncoding(nn.Module):
 
 
 class Embeddings(nn.Module):
-    def __init__(self, vocab_size, d_model):
+    def __init__(self, vocab_size, d_model=512):
         super(Embeddings, self).__init__()
 
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -141,8 +142,10 @@ class EncoderBlock(nn.Module):
             [Residual(features, dropout) for _ in range(2)]
         )
 
-    def forward(self, x):
-        x = self.residual_connection[0](x, lambda x: self.self_attn_block(x, x, x))
+    def forward(self, x, src_mask=None):
+        x = self.residual_connection[0](
+            x, lambda x: self.self_attn_block(x, x, x, src_mask)
+        )
         x = self.residual_connection[1](x, self.feed_forward)
 
         return x
@@ -151,53 +154,49 @@ class EncoderBlock(nn.Module):
 class Encoder(nn.Module):
     def __init__(
         self,
-        num_layers,
+        layers: nn.ModuleList,
         features,
-        self_attn_block: AttentionBlock,
-        feed_forward: FeedForward,
-        dropout,
     ):
         super(Encoder, self).__init__()
 
-        self.layers = nn.ModuleList(
-            [
-                EncoderBlock(features, self_attn_block, feed_forward, dropout)
-                for _ in range(num_layers)
-            ]
-        )
+        self.layers = layers
+        self.norm = LayerNorm(features)
 
-    def forward(self, x):
+    def forward(self, x, src_mask):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, src_mask)
 
-        return x
+        return self.norm(x)
 
 
 class DecoderBlock(nn.Module):
+
     def __init__(
         self,
         features,
         self_attn_block: AttentionBlock,
-        src_attn_block: AttentionBlock,
+        cross_attn_block: AttentionBlock,
         feed_forward: FeedForward,
         dropout,
     ):
         super(DecoderBlock, self).__init__()
 
         self.self_attn_block = self_attn_block
-        self.src_attn_block = src_attn_block
+        self.cross_attn_block = cross_attn_block
         self.feed_forward = feed_forward
         self.residual_connection = nn.ModuleList(
             [Residual(features, dropout) for _ in range(3)]
         )
 
-    def forward(self, x, encoder_output, tgt_mask):
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
         x = self.residual_connection[0](
             x, lambda x: self.self_attn_block(x, x, x, tgt_mask)
         )
         x = self.residual_connection[1](
             x,
-            lambda x: self.src_attn_block(x, encoder_output, encoder_output),
+            lambda x: self.cross_attn_block(
+                x, encoder_output, encoder_output, src_mask
+            ),
         )
         x = self.residual_connection[2](x, self.feed_forward)
 
@@ -207,29 +206,18 @@ class DecoderBlock(nn.Module):
 class Decoder(nn.Module):
     def __init__(
         self,
-        num_layers,
+        layers: nn.ModuleList,
         features,
-        self_attn_block: AttentionBlock,
-        src_attn_block: AttentionBlock,
-        feed_forward: FeedForward,
-        dropout,
     ):
         super(Decoder, self).__init__()
 
-        self.layers = nn.ModuleList(
-            [
-                DecoderBlock(
-                    features, self_attn_block, src_attn_block, feed_forward, dropout
-                )
-                for _ in range(num_layers)
-            ]
-        )
-
+        self.layers = layers
         self.norm = LayerNorm(features)
 
-    def forward(self, x, encoder_output, tgt_mask):
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+
         for layer in self.layers:
-            x = layer(x, encoder_output, tgt_mask)
+            x = layer(x, encoder_output, src_mask, tgt_mask)
 
         return self.norm(x)
 
@@ -266,22 +254,20 @@ class Transformer(nn.Module):
         self.tgt_positional_encoding = tgt_positional_encoding
         self.generator = generator
 
-    def encode(self, src):
+    def encode(self, src, src_mask):
 
         src = self.src_positional_encoding(self.src_embed(src))
-        return self.encoder(src)
+        return self.encoder(src, src_mask)
 
-    def decode(self, tgt, encoder_output, tgt_mask):
+    def decode(self, tgt, encoder_output, src_mask, tgt_mask):
 
         tgt = self.tgt_positional_encoding(self.tgt_embed(tgt))
-        return self.decoder(tgt, encoder_output, tgt_mask)
+        return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
 
-    def forward(self, src, tgt, tgt_mask):
+    def forward(self, src, tgt, src_mask, tgt_mask):
 
-        encoder_output = self.encode(src)
-        return self.decode(tgt, encoder_output, tgt_mask)
-
-    # def
+        encoder_output = self.encode(src, src_mask)
+        return self.decode(encoder_output, src_mask, tgt, tgt_mask)
 
 
 def make_model(
@@ -295,33 +281,50 @@ def make_model(
     num_heads=8,
     dropout=0.1,
 ):
-    c = copy.deepcopy
 
-    attn = AttentionBlock(d_model, dropout, d_k, d_v)
-    ff = FeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
+    src_embed = Embeddings(src_vocab_size, d_model)
+    tgt_embed = Embeddings(tgt_vocab_size, d_model)
+
+    src_positional_encoding = PositionalEncoding(d_model, dropout)
+    tgt_positional_encoding = PositionalEncoding(d_model, dropout)
+
+    encoder_blocks = []
+    for _ in range(num_layers):
+
+        encoder_self_attn = AttentionBlock(d_model, dropout, d_k, d_v)
+        encoder_feed_forward = FeedForward(d_model, d_ff, dropout)
+        encoder_block = EncoderBlock(
+            d_model, encoder_self_attn, encoder_feed_forward, dropout
+        )
+
+        encoder_blocks.append(encoder_block)
+
+    encoder = Encoder(nn.ModuleList(encoder_blocks), d_model)
+
+    decoder_blocks = []
+    for _ in range(num_layers):
+
+        decoder_self_attn = AttentionBlock(d_model, dropout, d_k, d_v)
+        decoder_src_attn = AttentionBlock(d_model, dropout, d_k, d_v)
+        decoder_feed_forward = FeedForward(d_model, d_ff, dropout)
+        decoder_block = DecoderBlock(
+            d_model, decoder_self_attn, decoder_src_attn, decoder_feed_forward, dropout
+        )
+
+        decoder_blocks.append(decoder_block)
+
+    decoder = Decoder(nn.ModuleList(decoder_blocks), d_model)
+
+    generator = ProjectionLayer(d_model, tgt_vocab_size)
 
     model = Transformer(
-        encoder=Encoder(
-            num_layers,
-            d_model,
-            c(attn),
-            c(ff),
-            dropout,
-        ),
-        decoder=Decoder(
-            num_layers,
-            d_model,
-            c(attn),
-            c(attn),
-            c(ff),
-            dropout,
-        ),
-        src_embed=Embeddings(src_vocab_size, d_model),
-        tgt_embed=Embeddings(tgt_vocab_size, d_model),
-        src_positional_encoding=c(position),
-        tgt_positional_encoding=c(position),
-        generator=ProjectionLayer(d_model, tgt_vocab_size),
+        encoder,
+        decoder,
+        src_embed,
+        tgt_embed,
+        src_positional_encoding,
+        tgt_positional_encoding,
+        generator,
     )
 
     for p in model.parameters():
@@ -329,51 +332,3 @@ def make_model(
             nn.init.xavier_uniform_(p)
 
     return model
-
-
-class Inference:
-    """Object for holding a model during inference and some utility methods used when training the model."""
-
-    def __init__(self, src, tgt=None, pad=2):  # 2 = <blank>
-        self.src = src
-        if tgt is not None:
-            self.tgt = tgt[:, :-1]
-            self.tgt_y = tgt[:, 1:]
-            self.tgt_mask = self.make_std_mask(self.tgt, pad)
-            self.ntokens = (self.tgt_y != pad).data.sum()
-
-    @staticmethod
-    def greedy_decode(model, src, max_len, start_symbol):
-        memory = model.encode(src)
-        ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
-        for i in range(max_len - 1):
-            out = model.decode(
-                ys,
-                memory,
-                Inference.subsequent_mask(ys.shape[1]).type_as(src.data),
-            )
-            prob = model.generator(out[:, -1])
-            _, next_word = torch.max(prob, dim=1)
-            next_word = next_word.data[0]
-            ys = torch.cat(
-                [ys, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1
-            )
-        return ys
-
-    @staticmethod
-    def subsequent_mask(size):
-        "Mask out subsequent positions."
-        attn_shape = (1, size, size)
-        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(
-            torch.uint8
-        )
-        return subsequent_mask == 0
-
-    @staticmethod
-    def make_std_mask(tgt, pad):
-        "Create a mask to hide padding and future words."
-        tgt_mask = (tgt != pad).unsqueeze(-2)
-        tgt_mask = tgt_mask & Inference.subsequent_mask(tgt.shape[-1]).type_as(
-            tgt_mask.data
-        )
-        return tgt_mask

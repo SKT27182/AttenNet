@@ -24,3 +24,6 @@ Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
 
 where Q, K, and V are the query, key, and value matrices, respectively, and d_k is the dimension of the key vectors.
 
+## Tokenization
+
+Tokenization is the process of converting text into tokens. In this implementation, I will use the `torchtext` library to tokenize the text data. I have created a custom tokenizer that tokenizes the text data and converts the tokens into integer indices using ['Byte-Pair Encoding'](https://towardsdatascience.com/byte-pair-encoding-subword-based-tokenization-algorithm-77828a70bee0) (BPE) algorithm. The BPE algorithm is a simple data compression technique that replaces the most frequent pair of bytes with a single byte. 
